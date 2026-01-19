@@ -1,110 +1,109 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response, Cookie
 from fastapi.responses import HTMLResponse
+from typing import Optional
 import random
+import uuid
 
 app = FastAPI(title="Snapdragon 8 Elite (Gen 5) HIL Simulator")
 
-# --- Hardware State Machine ---
-chip_state = {
-    "battery_level": 100.0,
-    "global_temp": 40.0,
-    "power_mode": "Balance",  # Options: High Performance, Balance, Battery Saver, Ultra Saver
-    "is_throttling": False,
-    # 2 Prime Cores (Oryon) + 6 Performance Cores (Oryon)
-    "cores": [
-        {"id": i, "type": "Prime", "speed": 3.53, "temp": 40.0} if i < 2 
-        else {"id": i, "type": "Performance", "speed": 2.80, "temp": 40.0} 
-        for i in range(8)
-    ]
-}
+# --- Multi-Tenant Store ---
+# This dictionary maps session_id -> SnapdragonSimulator instance
+# This ensures every browser gets its own private "hardware" object
+user_sessions = {}
+
+class SnapdragonSimulator:
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        # Every chip starts at a fresh factory state
+        self.state = {
+            "battery_level": 100.0,
+            "global_temp": 40.0,
+            "power_mode": "Balance",
+            "is_throttling": False,
+            "cores": [
+                {"id": i, "type": "Prime", "speed": 3.53, "temp": 40.0} if i < 2 
+                else {"id": i, "type": "Performance", "speed": 2.80, "temp": 40.0} 
+                for i in range(8)
+            ]
+        }
+
+    def update_physics(self):
+        s = self.state
+        
+        # 1. Logic for Power Modes
+        if s["battery_level"] <= 5: s["power_mode"] = "Ultra Saver"
+        elif s["battery_level"] <= 20: s["power_mode"] = "Battery Saver"
+
+        if s["power_mode"] == "High Performance":
+            prime_t, perf_t, drain, heat = 4.32, 3.53, 0.45, 2.2
+        elif s["power_mode"] == "Balance":
+            prime_t, perf_t, drain, heat = 3.53, 2.80, 0.15, 0.4
+        else: # Power Savers
+            prime_t, perf_t, drain, heat = 1.20, 0.80, 0.05, -1.5
+
+        # 2. Thermal Throttling Governor
+        if s["global_temp"] > 85: s["is_throttling"] = True
+        elif s["global_temp"] < 65: s["is_throttling"] = False
+
+        if s["is_throttling"]:
+            prime_t, perf_t, heat = 1.80, 1.40, -3.5
+
+        # 3. Apply changes with Silicon Jitter (Randomness)
+        s["battery_level"] = max(0, round(s["battery_level"] - drain, 2))
+        s["global_temp"] = max(35, round(s["global_temp"] + heat + random.uniform(-0.5, 0.5), 1))
+
+        for core in s["cores"]:
+            target = prime_t if core["type"] == "Prime" else perf_t
+            core["speed"] = round(target + random.uniform(-0.03, 0.03), 2)
+            core["temp"] = round(s["global_temp"] + random.uniform(-1.0, 1.0), 1)
+        
+        return s
 
 @app.get("/telemetry")
-async def get_telemetry():
-    s = chip_state
+async def get_telemetry(response: Response, chip_session: Optional[str] = Cookie(None)):
+    # 1. IDENTIFY: If no cookie is present, this is a new browser/visit
+    if not chip_session:
+        chip_session = str(uuid.uuid4())
+        # Set the cookie so the browser identifies itself in the next request
+        response.set_cookie(key="chip_session", value=chip_session)
     
-    # 1. DYNAMIC POWER MODE ASSIGNMENT (PMIC Logic)
-    # Battery thresholds override user selection
-    if s["battery_level"] <= 5:
-        s["power_mode"] = "Ultra Saver"
-    elif s["battery_level"] <= 20:
-        s["power_mode"] = "Battery Saver"
-    # Note: Above 20%, it stays in 'High Performance' or 'Balance'
-
-    # 2. DEFINE CLOCK SPEED TARGETS & PHYSICS PER MODE
-    if s["power_mode"] == "High Performance":
-        prime_target = 4.32
-        perf_target = 3.53
-        drain_rate = 0.45  # Heavy drain
-        thermal_load = 2.2 # Heats up quickly
-    elif s["power_mode"] == "Balance":
-        prime_target = 3.53
-        perf_target = 2.80
-        drain_rate = 0.15  # Optimized
-        thermal_load = 0.4 # Stable heat
-    elif s["power_mode"] == "Battery Saver":
-        prime_target = 2.00
-        perf_target = 1.60
-        drain_rate = 0.05
-        thermal_load = -0.8 # Actively cooling
-    else: # Ultra Saver
-        prime_target = 1.20
-        perf_target = 0.80
-        drain_rate = 0.02
-        thermal_load = -2.0 # Rapid cooling
-
-    # 3. THERMAL THROTTLING (Safety Governor)
-    # Thresholds: 85°C to trigger, 65°C to recover (Hysteresis)
-    if s["global_temp"] > 85:
-        s["is_throttling"] = True
-    elif s["global_temp"] < 65:
-        s["is_throttling"] = False
-
-    if s["is_throttling"]:
-        # Forced clock cap to prevent hardware damage
-        prime_target = 1.80
-        perf_target = 1.40
-        thermal_load = -3.5 # Throttling forces cooling
-
-    # 4. PHYSICS SIMULATION STEP
-    s["battery_level"] = max(0, s["battery_level"] - drain_rate)
-    s["global_temp"] = max(35, s["global_temp"] + (thermal_load + random.uniform(-0.3, 0.3)))
-
-    # Update individual Core metrics
-    for core in s["cores"]:
-        target = prime_target if core["type"] == "Prime" else perf_target
-        # Add silicon jitter (cores are never exactly the same speed)
-        core["speed"] = round(target + random.uniform(-0.03, 0.03), 2)
-        core["temp"] = round(s["global_temp"] + random.uniform(-1.5, 1.5), 1)
-
+    # 2. ASSIGN: Create or get the specific simulator for this cookie
+    if chip_session not in user_sessions:
+        user_sessions[chip_session] = SnapdragonSimulator(chip_session)
+    
+    sim = user_sessions[chip_session]
+    state = sim.update_physics()
+    
     return {
+        "device_id": chip_session,
         "chipset": "Snapdragon 8 Elite (Gen 5)",
-        "battery": round(s["battery_level"], 1),
-        "power_mode": s["power_mode"],
-        "thermal_status": "THROTTLING" if s["is_throttling"] else "OPTIMAL",
-        "global_temp": round(s["global_temp"], 1),
-        "cores": s["cores"]
+        "battery": state["battery_level"],
+        "power_mode": state["power_mode"],
+        "thermal_status": "THROTTLING" if state["is_throttling"] else "OPTIMAL",
+        "global_temp": state["global_temp"],
+        "cores": state["cores"]
     }
 
 @app.post("/set_mode")
-async def set_mode(mode: str):
-    """Sets the performance profile if battery allows"""
-    valid_modes = ["High Performance", "Balance"]
-    if mode not in valid_modes:
-        raise HTTPException(status_code=400, detail=f"Invalid mode. Choose from {valid_modes}")
+async def set_mode(mode: str, chip_session: Optional[str] = Cookie(None)):
+    if not chip_session or chip_session not in user_sessions:
+        raise HTTPException(status_code=400, detail="No active session found")
+        
+    sim = user_sessions[chip_session]
+    if mode not in ["High Performance", "Balance"]:
+        raise HTTPException(status_code=400, detail="Invalid mode")
     
-    if chip_state["battery_level"] <= 20:
-        raise HTTPException(status_code=400, detail="Cannot switch to performance modes: Battery below 20%")
+    if sim.state["battery_level"] <= 20:
+        raise HTTPException(status_code=400, detail="Battery too low for performance modes")
     
-    chip_state["power_mode"] = mode
+    sim.state["power_mode"] = mode
     return {"status": f"Successfully switched to {mode}"}
 
 @app.post("/reboot")
-async def reboot():
-    """Restores chip to initial factory state for testing clean slate"""
-    chip_state["battery_level"] = 100.0
-    chip_state["global_temp"] = 40.0
-    chip_state["power_mode"] = "Balance"
-    chip_state["is_throttling"] = False
+async def reboot(chip_session: Optional[str] = Cookie(None)):
+    if chip_session in user_sessions:
+        # Reset the simulator object for this specific user
+        user_sessions[chip_session] = SnapdragonSimulator(chip_session)
     return {"status": "SoC Rebooted"}
 
 @app.get("/", response_class=HTMLResponse)
@@ -290,3 +289,5 @@ async def get_dashboard():
         </body>
     </html>
     """
+
+
