@@ -1,0 +1,12 @@
+snapdragon_hil/
+├── simulator/             # The "Digital Twin" of the SoC
+│   └── chip_api.py        # Our FastAPI code
+├── framework/             # The Automation Engine
+│   ├── pages/             # Page Object Model (POM) files
+│   └── utils/             # Helper scripts (like the bit parser)
+├── tests/                 # The actual Test Suites
+│   ├── conftest.py        # Fixtures and setup logic
+│   └── test_telemetry.py  # Our first test file
+    └── test_ui.py 
+├── requirements.txt       # Dependencies
+└── .gitignore             # To keep our repo clean
